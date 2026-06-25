@@ -1,0 +1,235 @@
+# This configure file includes most necessary parameters for running the MSNoise dv/v calculation workflow.
+# However, there're still many minor parameters are not included and can make difference in the result.
+# I would suggest users to read the MSNoise documentation and see if you can put the parameters you desire in the section, named "[dvv_calculation.msnoise.extra_msnoise_config]"
+# You are welcome to have suggestions for improvments, please feel free to reach out or submit a pull request.
+# Thank you!
+# HM, 2026
+
+### WORKFLOW ###
+[workflow]
+
+active_stage = "dvv_calculation"
+# Available workflow stage: dvv_calculation.
+
+### MSNOISE DV/V CALCULATION ###
+[dvv_calculation.msnoise]
+
+run_commands = true
+# false means only list configured commands.
+# true means actually call the MSNoise commands below.
+
+prepare_project = true
+# true means this runner will initialize msnoise.sqlite, scan SDS files, and
+# write station/filter/config entries before MSNoise commands.
+# If use_existing_sds is false, it also downloads waveform data.
+# false means the fixed MSNoise project folder already contains a prepared project.
+
+use_existing_sds = true
+# true means use the existing SDS archive in the project folder and skip FDSN
+# waveform discovery/download entirely. Station/channel rows are derived from
+# the SDS filenames, then msnoise scan_archive is run on that SDS tree.
+
+reset_project_dir = false
+# Only used when prepare_project is true.
+# true deletes the fixed MSNoise project folder before rebuilding it.
+# Must be false when use_existing_sds is true, otherwise existing SDS hardlinks
+# would be deleted.
+
+clear_jobs_on_run = true
+# true clears existing MSNoise jobs before recreating them.
+# This makes reruns safe after changing the time range or reference window.
+
+skip_existing_downloads = true
+# true reuses existing hourly raw_mseed chunks instead of downloading them again.
+
+commands = [
+  ["msnoise", "new_jobs", "--init"],
+  ["msnoise", "reset", "--all", "CC"],
+  ["msnoise", "compute_cc"],
+  ["msnoise", "reset", "--all", "STACK"],
+  ["msnoise", "stack", "-r"],
+  ["msnoise", "reset", "STACK"],
+  ["msnoise", "stack", "-m"],
+  ["msnoise", "reset", "--all", "MWCS"],
+  ["msnoise", "compute_mwcs"],
+  ["msnoise", "reset", "--all", "DTT"],
+  ["msnoise", "compute_dtt"],
+]
+# Command sequence for a full MSNoise dv/v calculation.
+# You can shorten or reorder this list when restarting from an intermediate step.
+
+data_type = "D"
+# MSNoise data_type config value for daily SDS waveform files. D stands for "day".
+# It means each file contains one day of data in SDS
+
+geographic_bounds = { minlatitude = 63.8023, maxlatitude = 63.8968, minlongitude = -22.4933, maxlongitude = -22.3377}
+# User-facing station search area used when prepare_project is true.
+# The runner discovers matching stations from the FDSN station service.
+
+channels = "EH?,HH?"
+# Default FDSN channel selector used when prepare_project is true.
+# You can use "BHZ,HHZ", "BH?,HH?", "*Z" or similar to specify multiple channels.
+# If you are using DAS datasets, you should look up the channel code.
+
+location = "*"
+# FDSN location selector used when prepare_project is true.
+# Use comma-separated location codes such as "00,10,60", or "*" for all locations.
+
+split_locations_as_stations = false
+# true maps location-specific channels to separate MSNoise station aliases.
+# For example, ANTO maps location 00/10/60 to ANT00/ANT10/ANT60.
+
+max_channels = 0
+# Optional limit after automatic provider/routing discovery.
+# 0 means no limit.
+
+min_sample_rate = 0
+# Optional channel sample-rate filter in Hz after discovery.
+# 0 means no filter.
+
+
+start_date = "2021-03-01T00:00:00"
+# Waveform download start time used when prepare_project is true.
+
+end_date = "2022-01-01T00:00:00"
+# Waveform download end time used when prepare_project is true.
+
+download_chunk_hours = 1
+# Waveform download chunk length in hours.
+
+download_timeout = 120
+# Curl timeout in seconds for each waveform request.
+
+curl_retries = 5
+# Curl retry count for each waveform request.
+
+curl_retry_delay = 5
+# Seconds to wait between curl retries.
+
+waveform_download_attempts = 3
+# Number of full download-and-ObsPy-read attempts for each waveform chunk.
+# This catches cases where curl returns HTTP 200 but the miniSEED payload is corrupt.
+
+no_data_behavior = "skip"
+# Behavior when FDSN returns HTTP 204 for a requested waveform chunk.
+# Choose "skip" to print a warning and continue, or "fail" to stop immediately.
+
+bad_waveform_behavior = "skip"
+# Behavior when a downloaded waveform cannot be read by ObsPy after all attempts.
+# Choose "skip" to continue with a gap, or "fail" to stop immediately.
+
+msnoise_startdate = ""
+msnoise_enddate = ""
+# Optional MSNoise processing start/end dates.
+# Leave blank to derive them from start_date/end_date.
+
+ref_begin = "2021-05-01"
+ref_end = "2021-05-14"
+# Optional reference stack begin/end dates.
+# Leave blank to use the MSNoise processing date range.
+# Please note that MSNoise only except YYYY-MM-DD format for ref_begin/ref_end, so the time portion is ignored and the reference period always starts at 00:00:00.
+
+autocorr = "Y"
+# Required for single-station runs discovered from a small geographic area.
+
+components_to_compute = "ZZ,NN,EE"
+# Cross-station components to compute.
+# If you are using DAS datasets, you should look up the channel code.
+
+components_to_compute_single_station = "ZZ,NN,EE"
+# Single-station components to compute.
+# If you are using DAS datasets, you should look up the channel code.
+
+mov_stack = "1"
+# Moving stack length in days.
+# MSNoise (2025) now only supports one-day moving stacks, so this should be set to 1.
+# In other words, your dt/t (dv/v) results will be daily no matter what you set up for analysis_duration and corr_duration
+
+analysis_duration = "3600"
+# MSNoise analysis duration in seconds.
+# This is only for seperate chuncks of jobs for MSNoise
+# 86400 means you are doing one day per job, 3600 means you are doing one hour per job, and so on.
+# If you're interested in making hourly dv/v time series, you should set this and corr_duration to 3600.
+
+corr_duration = "3600"
+# Correlation window duration in seconds.
+# 3600 means you are calculating dv/v values for one-hour correlation windows, 86400 means one-day correlation windows, and so on.
+# It doesn't mean you will have hourly results if you set this to 3600, because the actual output cadence also depends on mov_stack and the time range of your data.
+
+cc_sampling_rate = "20.0"
+# MSNoise target sampling rate for cross-correlation.
+# It will downsample the raw waveforms to this sampling rate before correlation.
+
+whitening = "A"
+# MSNoise spectral whitening mode.
+# Choose "A" to apply spectral whitening to all data, or "N" for no spectral whitening.
+
+stack_method = "pws"
+# MSNoise stack method. You can use linear or pws.
+
+dtt_lag = "static"
+# DTT lag mode. Use "static" for a fixed coda window or "dynamic" for velocity-based lags.
+
+dtt_v = "1.5"
+# Apparent velocity used by dynamic DTT lag selection.
+# If you already have a good estimate of the velocity structure, you can set this to a more specific value.
+# If not, I would suggest you to use "static" for dtt_lag and take a look at the CCF and to see which part of CCF you want for your velocity estimate
+
+dtt_width = "30.0"
+# DTT coda window width in seconds.
+# If you choose to use "static", this is the fixed window width starting at dtt_lag.
+
+dtt_sides = "both"
+# Coda side used for DTT regression.
+# Which side you want to use for your velocity estimate
+
+dtt_minlag = "5.0"
+# Minimum DTT coda lag in seconds.
+# The starting point you want for your velocity estimate window
+
+dtt_mincoh = "0.7"
+# Minimum MWCS coherence used in dt/t regression.
+# The threshold for dt/t regression based on the coherence.
+
+dtt_maxerr = "2.0"
+# Maximum MWCS error used in dt/t regression.
+# Set up a threshold to remove the results with high MWCS estimated error 
+
+dtt_maxdt = "2.0"
+# Maximum dt value used in dt/t regression.
+# Set up a threshold to remove the results with large dt values
+
+validate_outputs = true
+# true means check expected MSNoise products after commands finish.
+
+require_ref = true
+# true means fail if REF stacks are missing.
+
+require_mwcs = true
+# true means fail if MWCS files are missing.
+
+require_dtt = true
+# true means fail if DTT files are missing.
+
+### MSNOISE FILTER CONFIGURATION ###
+[[dvv_calculation.msnoise.filters]]
+ref = 1
+# Filter 01.
+low = 1
+# Lower frequency for correlation filtering.
+mwcs_low = 1
+# Lower frequency for MWCS.
+high = 5
+# Upper frequency for correlation filtering.
+mwcs_high = 5
+# Upper frequency for MWCS.
+rms_threshold = 0.0
+# RMS threshold used by MSNoise filter config.
+mwcs_wlen = 15.0
+# MWCS moving window length in seconds.
+mwcs_step = 4.0
+# MWCS moving window step in seconds.
+
+[dvv_calculation.msnoise.extra_msnoise_config]
+# Optional raw MSNoise config overrides.
+# Add entries here only when a MSNoise key is not already exposed in this configure file.
