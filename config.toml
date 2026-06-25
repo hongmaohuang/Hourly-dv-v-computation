@@ -19,28 +19,17 @@ run_commands = true
 # true means actually call the MSNoise commands below.
 
 prepare_project = true
-# true means this runner will initialize msnoise.sqlite, scan SDS files, and
-# write station/filter/config entries before MSNoise commands.
-# If use_existing_sds is false, it also downloads waveform data.
+# true means this runner will initialize msnoise.sqlite, scan the existing SDS
+# archive, and write station/filter/config entries before MSNoise commands.
 # false means the fixed MSNoise project folder already contains a prepared project.
 
-use_existing_sds = true
-# true means use the existing SDS archive in the project folder and skip FDSN
-# waveform discovery/download entirely. Station/channel rows are derived from
-# the SDS filenames, then msnoise scan_archive is run on that SDS tree.
-
 reset_project_dir = false
-# Only used when prepare_project is true.
-# true deletes the fixed MSNoise project folder before rebuilding it.
-# Must be false when use_existing_sds is true, otherwise existing SDS hardlinks
-# would be deleted.
+# Must remain false. This package no longer downloads waveform data, so deleting
+# the project folder would also delete the user-provided SDS archive.
 
 clear_jobs_on_run = true
 # true clears existing MSNoise jobs before recreating them.
 # This makes reruns safe after changing the time range or reference window.
-
-skip_existing_downloads = true
-# true reuses existing hourly raw_mseed chunks instead of downloading them again.
 
 commands = [
   ["msnoise", "new_jobs", "--init"],
@@ -63,60 +52,26 @@ data_type = "D"
 # It means each file contains one day of data in SDS
 
 geographic_bounds = { minlatitude = 63.8023, maxlatitude = 63.8968, minlongitude = -22.4933, maxlongitude = -22.3377}
-# User-facing station search area used when prepare_project is true.
-# The runner discovers matching stations from the FDSN station service.
+# Optional metadata for documenting the station area used in this run.
 
 channels = "EH?,HH?"
-# Default FDSN channel selector used when prepare_project is true.
+# Channel selector used to filter existing SDS files.
 # You can use "BHZ,HHZ", "BH?,HH?", "*Z" or similar to specify multiple channels.
 # If you are using DAS datasets, you should look up the channel code.
 
 location = "*"
-# FDSN location selector used when prepare_project is true.
+# Location selector used to filter existing SDS files.
 # Use comma-separated location codes such as "00,10,60", or "*" for all locations.
 
 split_locations_as_stations = false
 # true maps location-specific channels to separate MSNoise station aliases.
 # For example, ANTO maps location 00/10/60 to ANT00/ANT10/ANT60.
 
-max_channels = 0
-# Optional limit after automatic provider/routing discovery.
-# 0 means no limit.
-
-min_sample_rate = 0
-# Optional channel sample-rate filter in Hz after discovery.
-# 0 means no filter.
-
-
 start_date = "2021-03-01T00:00:00"
-# Waveform download start time used when prepare_project is true.
+# MSNoise processing start time. Waveforms must already exist in SDS.
 
 end_date = "2022-01-01T00:00:00"
-# Waveform download end time used when prepare_project is true.
-
-download_chunk_hours = 1
-# Waveform download chunk length in hours.
-
-download_timeout = 120
-# Curl timeout in seconds for each waveform request.
-
-curl_retries = 5
-# Curl retry count for each waveform request.
-
-curl_retry_delay = 5
-# Seconds to wait between curl retries.
-
-waveform_download_attempts = 3
-# Number of full download-and-ObsPy-read attempts for each waveform chunk.
-# This catches cases where curl returns HTTP 200 but the miniSEED payload is corrupt.
-
-no_data_behavior = "skip"
-# Behavior when FDSN returns HTTP 204 for a requested waveform chunk.
-# Choose "skip" to print a warning and continue, or "fail" to stop immediately.
-
-bad_waveform_behavior = "skip"
-# Behavior when a downloaded waveform cannot be read by ObsPy after all attempts.
-# Choose "skip" to continue with a gap, or "fail" to stop immediately.
+# MSNoise processing end time. Waveforms must already exist in SDS.
 
 msnoise_startdate = ""
 msnoise_enddate = ""
@@ -130,7 +85,7 @@ ref_end = "2021-05-14"
 # Please note that MSNoise only except YYYY-MM-DD format for ref_begin/ref_end, so the time portion is ignored and the reference period always starts at 00:00:00.
 
 autocorr = "Y"
-# Required for single-station runs discovered from a small geographic area.
+# Required for single-station runs.
 
 components_to_compute = "ZZ,NN,EE"
 # Cross-station components to compute.

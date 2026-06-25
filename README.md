@@ -14,16 +14,39 @@ Please report any bugs you encounter; pull requests for improvements are also we
 
 ## Usage
 1. Set up `config.toml`.
-2. Run the workflow:
+2. Put your waveform files into the SDS archive before running. This package does not download waveform data.
+3. Run the workflow:
 ```bash
 python main.py
 ```
 
 ## Configuration
-The workflow is controlled through `config.toml`. The only supported stage is `dvv_calculation`; MSNoise settings, including the data-discovery window, dv/v calculation parameters, and filter definitions, are documented directly in the config file.
+The workflow is controlled through `config.toml`. The only supported stage is `dvv_calculation`; MSNoise settings, including the processing window, channel selectors, dv/v calculation parameters, and filter definitions, are documented directly in the config file.
 
-## Input File Formats
-Waveform discovery, download, SDS usage, and MSNoise processing are configured in `config.toml`. Relative paths are resolved from the project root.
+## Input Waveforms
+Waveform download and FDSN discovery are intentionally not included. Users must prepare an SDS archive that MSNoise can scan:
+
+```text
+outputs/dvv_calculation/testing/SDS/
+```
+
+The SDS archive should use the standard daily SDS layout:
+
+```text
+outputs/dvv_calculation/testing/SDS/
+└── YYYY/
+    └── NET/
+        └── STA/
+            └── NET.STA.LOC.CHA.D.YYYY.JJJ
+```
+
+For example, a daily HHZ file for station `ABC` in network `XX`, empty location code, and Julian day 60 of 2021 would be placed as:
+
+```text
+outputs/dvv_calculation/testing/SDS/2021/XX/ABC/XX.ABC..HHZ.D.2021.060
+```
+
+Relative paths are resolved from the project root.
 
 ## Formulation
 *This section is under development. Please refer to the articles listed in the References section for now.*
