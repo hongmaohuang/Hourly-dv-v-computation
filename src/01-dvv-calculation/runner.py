@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import fnmatch
+import importlib.util
 import sqlite3
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,8 +16,8 @@ except ModuleNotFoundError:
     import tomli as tomllib
 
 
-MSNOISE_PROJECT_DIR = "outputs/dvv_calculation/testing"
-SDS_FOLDER = "SDS"
+DEFAULT_MSNOISE_PROJECT_DIR = "outputs"
+DEFAULT_SDS_FOLDER = "SDS"
 CHANNEL_METADATA_FILENAME = "channel_metadata.csv"
 DATA_STRUCTURE = "SDS"
 MSNOISE_DB_TECH = "1"
@@ -44,8 +46,11 @@ class ChannelTarget:
 
 @dataclass(frozen=True)
 class DvvRunResult:
-    msnoise_commands: list[list[str]]
+    cadence: str
+    ccf_backend: str
+    ccf_commands: list[list[str]]
     validation: dict[str, object]
+    hourly_validation: dict[str, object]
 
 
 def load_config(path: str | Path) -> dict:
@@ -151,6 +156,70 @@ def _msnoise_station_name(target: ChannelTarget, msnoise_cfg: dict) -> str:
     return f"{target.station[:3]}{location[:2]}".upper()
 
 
+def _configured_component_pairs(msnoise_cfg: dict) -> list[str]:
+    pairs: list[str] = []
+    for key in ("components_to_compute", "components_to_compute_single_station"):
+        raw_value = str(msnoise_cfg.get(key) or "")
+        for item in raw_value.split(","):
+            pair = item.strip().upper()
+            if pair:
+                pairs.append(pair)
+    return sorted(set(pairs))
+
+
+def _validate_component_pairs(msnoise_cfg: dict, targets: list[ChannelTarget]) -> None:
+    component_pairs = _configured_component_pairs(msnoise_cfg)
+    if not component_pairs:
+        raise ValueError(
+            "No MSNoise components are configured. Set components_to_compute "
+            "or components_to_compute_single_station."
+        )
+
+    unsupported_pairs = [pair for pair in component_pairs if len(pair) != 2 or set(pair) - set("ZEN12")]
+    if unsupported_pairs:
+        raise ValueError(
+            "Unsupported MSNoise component pair(s) for this workflow: "
+            + ", ".join(unsupported_pairs)
+            + ". MSNoise compute_cc is reliable here for channel component letters "
+            "Z/E/N/1/2. For channels such as HSF whose component letter is F, "
+            "compute those data in a separate backend or provide precomputed keep_all CCF HDF5 files."
+        )
+
+    available_components = {target.channel[-1].upper() for target in targets if target.channel}
+    required_components = set("".join(component_pairs))
+    missing_components = sorted(required_components - available_components)
+    if missing_components:
+        raise RuntimeError(
+            "Configured component pair(s) require channel component(s) not present "
+            "in the selected SDS files: "
+            + ", ".join(missing_components)
+            + f". Available components: {', '.join(sorted(available_components)) or 'none'}. "
+            "Adjust channels/components_to_compute for this instrument family."
+        )
+
+
+def _validate_location_handling(msnoise_cfg: dict, targets: list[ChannelTarget]) -> None:
+    locations_by_station: dict[tuple[str, str], set[str]] = {}
+    for target in targets:
+        locations_by_station.setdefault((target.network, target.station), set()).add(target.location or "")
+    mixed_location_stations = {
+        f"{network}.{station}": sorted(location or "--" for location in locations)
+        for (network, station), locations in locations_by_station.items()
+        if len(locations) > 1
+    }
+    if mixed_location_stations and not bool(msnoise_cfg.get("split_locations_as_stations", False)):
+        examples = "; ".join(
+            f"{station}={','.join(locations)}"
+            for station, locations in list(sorted(mixed_location_stations.items()))[:5]
+        )
+        raise RuntimeError(
+            "Selected SDS files include multiple location codes for the same station, "
+            "but split_locations_as_stations is false. This can mix physically distinct "
+            "channels inside one MSNoise station. Set split_locations_as_stations = true "
+            f"or restrict location to one code. Examples: {examples}"
+        )
+
+
 def _target_sampling_rate(msnoise_cfg: dict) -> float:
     return float(require_value(msnoise_cfg, "cc_sampling_rate", "dvv_calculation.msnoise"))
 
@@ -179,13 +248,14 @@ def _parse_sds_filename(file_path: Path) -> dict[str, str] | None:
     if len(parts) != 7:
         return None
     net, sta, loc, cha, data_type, year, julian_day = parts
-    if data_type != "D" or not year.isdigit() or not julian_day.isdigit():
+    if not year.isdigit() or not julian_day.isdigit():
         return None
     return {
         "network": net,
         "station": sta,
         "location": loc,
         "channel": cha,
+        "data_type": data_type,
         "year": year,
         "julian_day": julian_day,
     }
@@ -196,7 +266,7 @@ def _sds_file_matches_config(file_path: Path, msnoise_cfg: dict) -> bool:
     if not parsed:
         return False
     data_type = str(msnoise_cfg.get("data_type") or "D")
-    if f".{data_type}." not in file_path.name:
+    if parsed["data_type"] != data_type:
         return False
     return (
         _channel_matches_selector(parsed["channel"], msnoise_cfg.get("channels", "*"))
@@ -272,7 +342,7 @@ def _write_channel_metadata(project_dir: Path, targets: list[ChannelTarget], msn
 
 
 def _existing_sds_channel_targets(msnoise_cfg: dict, project_dir: Path) -> list[ChannelTarget]:
-    sds_root = project_dir / SDS_FOLDER
+    sds_root = _sds_root(msnoise_cfg, project_dir)
     if not sds_root.exists():
         raise FileNotFoundError(f"Existing SDS directory does not exist: {sds_root}")
 
@@ -341,8 +411,10 @@ def _station_rows_from_targets(targets: list[ChannelTarget], msnoise_cfg: dict) 
 
 
 def _prepare_existing_sds_project(msnoise_cfg: dict, project_dir: Path) -> tuple[Path, list[dict[str, object]]]:
-    sds_root = project_dir / SDS_FOLDER
+    sds_root = _sds_root(msnoise_cfg, project_dir)
     targets = _existing_sds_channel_targets(msnoise_cfg, project_dir)
+    _validate_component_pairs(msnoise_cfg, targets)
+    _validate_location_handling(msnoise_cfg, targets)
     _write_channel_metadata(project_dir, targets, msnoise_cfg)
     station_rows = _station_rows_from_targets(targets, msnoise_cfg)
 
@@ -355,6 +427,101 @@ def _prepare_existing_sds_project(msnoise_cfg: dict, project_dir: Path) -> tuple
 
 def _set_msnoise_config(cursor, name: str, value: object) -> None:
     cursor.execute("INSERT OR REPLACE INTO config (name, value) VALUES (?, ?)", (name, str(value)))
+
+
+def _hourly_cfg(cfg: dict) -> dict:
+    dvv_cfg = require_mapping(cfg, "dvv_calculation")
+    hourly_cfg = dvv_cfg.get("hourly", {})
+    if isinstance(hourly_cfg, dict):
+        return hourly_cfg
+    return {}
+
+
+def _output_cfg(cfg: dict) -> dict:
+    dvv_cfg = require_mapping(cfg, "dvv_calculation")
+    output_cfg = dvv_cfg.get("output", {})
+    if isinstance(output_cfg, dict):
+        return output_cfg
+    return {}
+
+
+def _output_cadence(cfg: dict) -> str:
+    cadence = str(_output_cfg(cfg).get("cadence", "hourly")).strip().lower()
+    if cadence not in {"hourly", "daily"}:
+        raise ValueError("dvv_calculation.output.cadence must be 'hourly' or 'daily'")
+    return cadence
+
+
+def _hourly_enabled(cfg: dict) -> bool:
+    return _output_cadence(cfg) == "hourly"
+
+
+def _commands_for_cadence(cfg: dict, msnoise_cfg: dict) -> list[list[str]]:
+    cadence = _output_cadence(cfg)
+    raw_commands = _output_cfg(cfg).get(f"{cadence}_commands")
+    if raw_commands is None:
+        raw_commands = msnoise_cfg.get("commands")
+    if not isinstance(raw_commands, list) or not raw_commands:
+        raise ValueError(
+            f"dvv_calculation.output.{cadence}_commands must contain at least one command"
+        )
+    commands: list[list[str]] = []
+    for command in raw_commands:
+        if not isinstance(command, list) or not command:
+            raise ValueError(f"Invalid command in {cadence}_commands: {command!r}")
+        commands.append([str(part) for part in command])
+    return commands
+
+
+def _ccf_cfg(cfg: dict) -> dict:
+    dvv_cfg = require_mapping(cfg, "dvv_calculation")
+    ccf_cfg = dvv_cfg.get("ccf", {})
+    if isinstance(ccf_cfg, dict):
+        return ccf_cfg
+    return {}
+
+
+def _ccf_backend(cfg: dict) -> str:
+    return str(_ccf_cfg(cfg).get("backend", "msnoise")).strip().lower()
+
+
+def _msnoise_project_dir(cfg: dict, msnoise_cfg: dict | None = None) -> Path:
+    if msnoise_cfg is None:
+        dvv_cfg = require_mapping(cfg, "dvv_calculation")
+        raw_msnoise_cfg = dvv_cfg.get("msnoise")
+        if not isinstance(raw_msnoise_cfg, dict):
+            raise KeyError("Missing required config object: dvv_calculation.msnoise")
+        msnoise_cfg = raw_msnoise_cfg
+    return resolve_path(cfg, msnoise_cfg.get("project_dir", DEFAULT_MSNOISE_PROJECT_DIR))
+
+
+def _sds_root(msnoise_cfg: dict, project_dir: Path) -> Path:
+    path = Path(str(msnoise_cfg.get("sds_folder", DEFAULT_SDS_FOLDER))).expanduser()
+    if path.is_absolute():
+        return path
+    return (project_dir / path).resolve()
+
+
+def _load_hourly_module():
+    module_path = Path(__file__).with_name("hourly.py")
+    spec = importlib.util.spec_from_file_location("hourly_dvv_runner", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load hourly dv/v runner from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_native_ccf_module():
+    module_path = Path(__file__).with_name("native_ccf.py")
+    spec = importlib.util.spec_from_file_location("native_scalar_ccf_runner", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load native scalar CCF runner from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _write_msnoise_processing_config(cursor, msnoise_cfg: dict) -> None:
@@ -447,6 +614,28 @@ def clear_msnoise_jobs(project_dir: Path) -> None:
         conn.close()
 
 
+def sync_cadence_msnoise_config(cfg: dict, project_dir: Path) -> None:
+    db_path = project_dir / "msnoise.sqlite"
+    if not db_path.exists():
+        raise FileNotFoundError(f"MSNoise database does not exist: {db_path}")
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    try:
+        if _output_cadence(cfg) == "hourly":
+            hourly_cfg = _hourly_cfg(cfg)
+            _set_msnoise_config(cursor, "keep_all", "Y")
+            keep_days = "Y" if bool(hourly_cfg.get("keep_daily_cc", False)) else "N"
+            _set_msnoise_config(cursor, "keep_days", keep_days)
+            _set_msnoise_config(cursor, "output_folder", hourly_cfg.get("source_folder", "CROSS_CORRELATIONS"))
+        else:
+            _set_msnoise_config(cursor, "keep_all", "N")
+            _set_msnoise_config(cursor, "keep_days", "Y")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _write_msnoise_station_table(msnoise_cfg: dict, project_dir: Path, station_rows: list[dict[str, object]]) -> None:
     db_path = project_dir / "msnoise.sqlite"
     if not db_path.exists():
@@ -514,7 +703,8 @@ def _run_msnoise_scan_archive(project_dir: Path, sds_root: Path) -> None:
 
 
 def _scan_msnoise_project(msnoise_cfg: dict, project_dir: Path, sds_root: Path, station_rows: list[dict[str, object]]) -> None:
-    _normalize_existing_sds_files(sds_root, _target_sampling_rate(msnoise_cfg), msnoise_cfg)
+    if bool(msnoise_cfg.get("normalize_existing_sds", False)):
+        _normalize_existing_sds_files(sds_root, _target_sampling_rate(msnoise_cfg), msnoise_cfg)
     _write_msnoise_station_table(msnoise_cfg, project_dir, station_rows)
     _clear_msnoise_data_availability(project_dir)
     _run_msnoise_scan_archive(project_dir, sds_root)
@@ -538,6 +728,9 @@ def run_msnoise_project_setup(msnoise_cfg: dict, project_dir: Path) -> None:
 
 
 def validate_msnoise_outputs(cfg: dict, project_dir: Path) -> dict[str, object]:
+    if _ccf_backend(cfg) != "msnoise":
+        return {}
+
     dvv_cfg = require_mapping(cfg, "dvv_calculation")
     msnoise_cfg = dvv_cfg.get("msnoise")
     if not isinstance(msnoise_cfg, dict) or not require_bool(msnoise_cfg, "validate_outputs", "dvv_calculation.msnoise"):
@@ -556,11 +749,15 @@ def validate_msnoise_outputs(cfg: dict, project_dir: Path) -> dict[str, object]:
     }
 
     missing: list[str] = []
-    if require_bool(msnoise_cfg, "require_ref", "dvv_calculation.msnoise") and not ref_files:
+    daily_required = (
+        _output_cadence(cfg) == "daily"
+        and bool(_output_cfg(cfg).get("require_outputs", True))
+    )
+    if (daily_required or require_bool(msnoise_cfg, "require_ref", "dvv_calculation.msnoise")) and not ref_files:
         missing.append("REF stacks")
-    if require_bool(msnoise_cfg, "require_mwcs", "dvv_calculation.msnoise") and not mwcs_files:
+    if (daily_required or require_bool(msnoise_cfg, "require_mwcs", "dvv_calculation.msnoise")) and not mwcs_files:
         missing.append("MWCS files")
-    if require_bool(msnoise_cfg, "require_dtt", "dvv_calculation.msnoise") and not dtt_files:
+    if (daily_required or require_bool(msnoise_cfg, "require_dtt", "dvv_calculation.msnoise")) and not dtt_files:
         missing.append("DTT files")
     if missing:
         raise RuntimeError(
@@ -584,29 +781,62 @@ def validate_msnoise_outputs(cfg: dict, project_dir: Path) -> dict[str, object]:
     return validation
 
 
-def run_msnoise_backend(cfg: dict) -> list[list[str]]:
+def run_ccf_backend(cfg: dict) -> tuple[str, list[list[str]], dict[str, object]]:
     dvv_cfg = require_mapping(cfg, "dvv_calculation")
     msnoise_cfg = dvv_cfg.get("msnoise")
     if not isinstance(msnoise_cfg, dict):
         raise KeyError("Missing required config object: dvv_calculation.msnoise")
 
-    commands = require_value(msnoise_cfg, "commands", "dvv_calculation.msnoise")
-    normalized_commands = [[str(part) for part in command] for command in commands]
+    backend = _ccf_backend(cfg)
+    if backend not in {"msnoise", "native_scalar"}:
+        raise ValueError("dvv_calculation.ccf.backend must be 'msnoise' or 'native_scalar'")
 
+    cadence = _output_cadence(cfg)
+    if cadence == "daily" and backend != "msnoise":
+        raise ValueError(
+            "Daily cadence must use dvv_calculation.ccf.backend='msnoise' so STACK, MWCS, "
+            "and DTT are computed directly by MSNoise."
+        )
+
+    project_dir = _msnoise_project_dir(cfg, msnoise_cfg)
+    normalized_commands = _commands_for_cadence(cfg, msnoise_cfg)
     if not require_bool(msnoise_cfg, "run_commands", "dvv_calculation.msnoise"):
-        return normalized_commands
+        if backend == "native_scalar":
+            return backend, [["native_scalar_ccf"]], {}
+        return backend, normalized_commands, {}
 
-    project_dir = resolve_path(cfg, MSNOISE_PROJECT_DIR)
+    if backend == "native_scalar":
+        project_dir.mkdir(parents=True, exist_ok=True)
+        native_ccf = _load_native_ccf_module()
+        native_result = native_ccf.run_native_scalar_ccf(cfg, project_dir)
+        return backend, [["native_scalar_ccf"]], {
+            "native_targets": native_result.targets,
+            "native_pairs": native_result.pairs,
+            "native_ccf_files": native_result.ccf_files,
+            "native_ccf_windows": native_result.ccf_windows,
+            "native_skipped_files": native_result.skipped_files,
+            "native_skipped_windows": native_result.skipped_windows,
+            "native_source_root": native_result.source_root,
+            "native_manifest": native_result.manifest_path,
+        }
 
     run_msnoise_project_setup(msnoise_cfg, project_dir)
     sync_msnoise_project_config(msnoise_cfg, project_dir)
+    sync_cadence_msnoise_config(cfg, project_dir)
     if require_bool(msnoise_cfg, "clear_jobs_on_run", "dvv_calculation.msnoise"):
         clear_msnoise_jobs(project_dir)
 
     for command in normalized_commands:
         subprocess.run(command, cwd=project_dir, check=True)
 
-    return normalized_commands
+    return backend, normalized_commands, {}
+
+
+def run_msnoise_backend(cfg: dict) -> list[list[str]]:
+    if _ccf_backend(cfg) != "msnoise":
+        raise RuntimeError("run_msnoise_backend was called while dvv_calculation.ccf.backend is not 'msnoise'")
+    backend, commands, _validation = run_ccf_backend(cfg)
+    return commands
 
 
 def run_dvv_calculation(cfg: dict) -> DvvRunResult:
@@ -615,21 +845,56 @@ def run_dvv_calculation(cfg: dict) -> DvvRunResult:
     if not isinstance(msnoise_cfg, dict):
         raise KeyError("Missing required config object: dvv_calculation.msnoise")
 
-    msnoise_commands = run_msnoise_backend(cfg)
-    project_dir = resolve_path(cfg, MSNOISE_PROJECT_DIR)
+    ccf_backend, ccf_commands, ccf_validation = run_ccf_backend(cfg)
+    project_dir = _msnoise_project_dir(cfg, msnoise_cfg)
     validation = validate_msnoise_outputs(cfg, project_dir)
+    validation.update(ccf_validation)
+    hourly_validation: dict[str, object] = {}
+    if _hourly_enabled(cfg) and require_bool(msnoise_cfg, "run_commands", "dvv_calculation.msnoise"):
+        hourly = _load_hourly_module()
+        hourly_result = hourly.run_hourly_dvv(cfg, project_dir)
+        hourly_validation = {
+            "source_files": hourly_result.source_files,
+            "stack_files": hourly_result.stack_files,
+            "mwcs_files": hourly_result.mwcs_files,
+            "dtt_rows": hourly_result.dtt_rows,
+            "output_csv": hourly_result.output_csv,
+        }
 
-    return DvvRunResult(msnoise_commands=msnoise_commands, validation=validation)
+    return DvvRunResult(
+        cadence=_output_cadence(cfg),
+        ccf_backend=ccf_backend,
+        ccf_commands=ccf_commands,
+        validation=validation,
+        hourly_validation=hourly_validation,
+    )
 
 
 def print_result(result: DvvRunResult) -> None:
-    print("dv/v method: msnoise")
-    if result.msnoise_commands:
-        print("MSNoise commands configured:")
-        for command in result.msnoise_commands:
+    print(f"Result cadence: {result.cadence}")
+    print(f"CCF backend: {result.ccf_backend}")
+    if result.ccf_commands:
+        print("CCF steps configured:")
+        for command in result.ccf_commands:
             print("  " + " ".join(command))
     if result.validation:
         print("Validation:")
+        if result.validation.get("native_targets") is not None:
+            print(f"  Native targets: {result.validation['native_targets']}")
+        if result.validation.get("native_pairs") is not None:
+            print(f"  Native pairs: {result.validation['native_pairs']}")
+        if result.validation.get("native_ccf_files") is not None:
+            print(f"  Native CCF files: {result.validation['native_ccf_files']}")
+        if result.validation.get("native_ccf_windows") is not None:
+            print(f"  Native CCF windows: {result.validation['native_ccf_windows']}")
+        if result.validation.get("native_skipped_files") is not None:
+            print(f"  Native skipped files: {result.validation['native_skipped_files']}")
+        if result.validation.get("native_skipped_windows") is not None:
+            print(f"  Native skipped windows: {result.validation['native_skipped_windows']}")
+        if result.validation.get("native_source_root"):
+            print(f"  Native CCF source: {result.validation['native_source_root']}")
+        if result.validation.get("native_manifest"):
+            print(f"  Native manifest: {result.validation['native_manifest']}")
         if result.validation.get("ref_files") is not None:
             print(f"  REF files: {result.validation['ref_files']}")
         if result.validation.get("mwcs_files") is not None:
@@ -642,3 +907,11 @@ def print_result(result: DvvRunResult) -> None:
             print("  Job summary:")
             for row in result.validation["job_summary"]:
                 print(f"    {row}")
+    if result.hourly_validation:
+        print("Hourly dv/v validation:")
+        print(f"  Source CCF files: {result.hourly_validation['source_files']}")
+        print(f"  Hourly stack files: {result.hourly_validation['stack_files']}")
+        print(f"  Hourly MWCS files: {result.hourly_validation['mwcs_files']}")
+        print(f"  Hourly DTT rows: {result.hourly_validation['dtt_rows']}")
+        if result.hourly_validation.get("output_csv"):
+            print(f"  Hourly dv/v CSV: {result.hourly_validation['output_csv']}")

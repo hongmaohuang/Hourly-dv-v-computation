@@ -12,26 +12,25 @@ active_stage = "dvv_calculation"
 # Available workflow stage: dvv_calculation.
 
 ### MSNOISE DV/V CALCULATION ###
-[dvv_calculation.msnoise]
+[dvv_calculation.output]
 
-run_commands = true
-# false means only list configured commands.
-# true means actually call the MSNoise commands below.
+cadence = "hourly"
+# Final dv/v cadence. Supported values:
+# "hourly": MSNoise computes keep-all hourly CCF windows, then this package
+#            computes hourly STACK, MWCS, and DTT.
+# "daily":  MSNoise directly computes daily STACK, MWCS, and DTT; hourly.py is
+#            not used. Daily cadence requires [dvv_calculation.ccf].backend = "msnoise".
 
-prepare_project = true
-# true means this runner will initialize msnoise.sqlite, scan the existing SDS
-# archive, and write station/filter/config entries before MSNoise commands.
-# false means the fixed MSNoise project folder already contains a prepared project.
+require_outputs = true
+# In daily mode, fail unless MSNoise produced REF, MWCS, and DTT files.
 
-reset_project_dir = false
-# Must remain false. This package no longer downloads waveform data, so deleting
-# the project folder would also delete the user-provided SDS archive.
+hourly_commands = [
+  ["msnoise", "new_jobs", "--init"],
+  ["msnoise", "reset", "--all", "CC"],
+  ["msnoise", "compute_cc"],
+]
 
-clear_jobs_on_run = true
-# true clears existing MSNoise jobs before recreating them.
-# This makes reruns safe after changing the time range or reference window.
-
-commands = [
+daily_commands = [
   ["msnoise", "new_jobs", "--init"],
   ["msnoise", "reset", "--all", "CC"],
   ["msnoise", "compute_cc"],
@@ -44,8 +43,50 @@ commands = [
   ["msnoise", "reset", "--all", "DTT"],
   ["msnoise", "compute_dtt"],
 ]
-# Command sequence for a full MSNoise dv/v calculation.
-# You can shorten or reorder this list when restarting from an intermediate step.
+
+[dvv_calculation.ccf]
+
+backend = "msnoise"
+# CCF backend.
+# "msnoise" uses MSNoise compute_cc and is the recommended/default path for
+# standard Z/E/N/1/2 component workflows.
+# "native_scalar" uses this package's scalar CCF implementation for component
+# letters that MSNoise compute_cc cannot select, such as DAS HSF -> FF. It uses
+# the same preprocessing, windowing, whitening, and correlation operations as
+# MSNoise's standard no-rotation compute_cc path.
+
+[dvv_calculation.msnoise]
+
+run_commands = true
+# false means only list the commands selected by output.cadence.
+# true means execute the selected hourly_commands or daily_commands.
+
+prepare_project = true
+# true means this runner will initialize msnoise.sqlite, scan the existing SDS
+# archive, and write station/filter/config entries before MSNoise commands.
+# false means the fixed MSNoise project folder already contains a prepared project.
+
+project_dir = "outputs"
+# MSNoise project directory. Relative paths are resolved from this repository's
+# config.toml directory. On Alpine, set this to a scratch/project path that
+# contains the SDS archive and has enough space for CROSS_CORRELATIONS and
+# HOURLY_DVV outputs.
+
+sds_folder = "SDS"
+# SDS archive folder. Relative paths are resolved from project_dir.
+
+reset_project_dir = false
+# Must remain false. This package no longer downloads waveform data, so deleting
+# the project folder would also delete the user-provided SDS archive.
+
+clear_jobs_on_run = true
+# true clears existing MSNoise jobs before recreating them.
+# This makes reruns safe after changing the time range or reference window.
+
+normalize_existing_sds = false
+# true reads every selected SDS file and rewrites files whose sampling rate
+# differs from cc_sampling_rate. Keep false for large Alpine runs unless you
+# intentionally need this repair pass.
 
 data_type = "D"
 # MSNoise data_type config value for daily SDS waveform files. D stands for "day".
@@ -66,6 +107,8 @@ location = "*"
 split_locations_as_stations = false
 # true maps location-specific channels to separate MSNoise station aliases.
 # For example, ANTO maps location 00/10/60 to ANT00/ANT10/ANT60.
+# Set true when the selected SDS files contain multiple location codes for the
+# same NET.STA; otherwise the runner will stop to prevent mixing locations.
 
 start_date = "2021-03-01T00:00:00"
 # MSNoise processing start time. Waveforms must already exist in SDS.
@@ -85,26 +128,32 @@ ref_end = "2021-05-14"
 # Please note that MSNoise only except YYYY-MM-DD format for ref_begin/ref_end, so the time portion is ignored and the reference period always starts at 00:00:00.
 
 autocorr = "Y"
-# Required for single-station runs.
+# Legacy MSNoise compatibility value. In current MSNoise, single-station jobs
+# are controlled by components_to_compute_single_station.
 
 components_to_compute = "ZZ,NN,EE"
 # Cross-station components to compute.
-# If you are using DAS datasets, you should look up the channel code.
+# These are component-pair codes, not full channel codes. For example, ENZ/HHZ/CHZ
+# use component Z and should use ZZ. This MSNoise backend supports Z/E/N/1/2
+# component letters. For channels ending in other letters, such as HSF, set
+# [dvv_calculation.ccf].backend = "native_scalar" and configure matching
+# component pairs such as FF.
 
 components_to_compute_single_station = "ZZ,NN,EE"
 # Single-station components to compute.
-# If you are using DAS datasets, you should look up the channel code.
+# Same component-letter constraints as components_to_compute.
 
 mov_stack = "1"
 # Moving stack length in days.
-# MSNoise (2025) now only supports one-day moving stacks, so this should be set to 1.
-# In other words, your dt/t (dv/v) results will be daily no matter what you set up for analysis_duration and corr_duration
+# Used directly by MSNoise when output.cadence="daily". Hourly cadence uses
+# hourly.stack_window_hours instead.
 
 analysis_duration = "3600"
 # MSNoise analysis duration in seconds.
 # This is only for seperate chuncks of jobs for MSNoise
 # 86400 means you are doing one day per job, 3600 means you are doing one hour per job, and so on.
-# If you're interested in making hourly dv/v time series, you should set this and corr_duration to 3600.
+# Hourly cadence requires corr_duration=3600; analysis_duration remains an
+# MSNoise job-size setting.
 
 corr_duration = "3600"
 # Correlation window duration in seconds.
@@ -117,7 +166,9 @@ cc_sampling_rate = "20.0"
 
 whitening = "A"
 # MSNoise spectral whitening mode.
-# Choose "A" to apply spectral whitening to all data, or "N" for no spectral whitening.
+# Standard MSNoise compute_cc supports "A" (whiten cross-station and
+# cross-component correlations, but bandpass autocorrelations) and "N"
+# (bandpass without whitening).
 
 stack_method = "pws"
 # MSNoise stack method. You can use linear or pws.
@@ -157,13 +208,13 @@ dtt_maxdt = "2.0"
 validate_outputs = true
 # true means check expected MSNoise products after commands finish.
 
-require_ref = true
+require_ref = false
 # true means fail if REF stacks are missing.
 
-require_mwcs = true
+require_mwcs = false
 # true means fail if MWCS files are missing.
 
-require_dtt = true
+require_dtt = false
 # true means fail if DTT files are missing.
 
 ### MSNOISE FILTER CONFIGURATION ###
@@ -185,6 +236,96 @@ mwcs_wlen = 15.0
 mwcs_step = 4.0
 # MWCS moving window step in seconds.
 
+[dvv_calculation.native_scalar_ccf]
+
+compute_autocorr = true
+# true admits components_to_compute_single_station pairs, including AC and SC.
+# This is the safe default for single-station DAS/channel workflows.
+
+compute_cross_pairs = false
+# true computes cross-station pairs as well. Be careful on Alpine: this scales
+# roughly as N^2 for each component family.
+
+max_station_pairs = 0
+# Safety cap for native cross-pair expansion. 0 means no explicit cap.
+
+max_unbounded_cross_pairs = 1000
+# If compute_cross_pairs=true and max_station_pairs=0, stop before expanding
+# more than this many station pairs unless allow_unbounded_cross_pairs=true.
+
+allow_unbounded_cross_pairs = false
+# Set true only after short-window testing if you intentionally want uncapped
+# native cross-station pair expansion.
+
+bad_waveform_behavior = "warn_skip"
+# "warn_skip" skips unreadable/invalid waveform days or windows and records them
+# in native_ccf_manifest.csv. "fail" stops immediately on the first bad file or
+# bad processing window.
+
+clear_output = true
+# true clears the configured hourly.source_folder before native CCF writes new
+# HDF5 files. This prevents stale CCF files from a previous run being consumed
+# by the hourly dv/v stage.
+
+progress_interval_pairs = 10
+# Print one native CCF progress line every N filter/pair combinations.
+
+[dvv_calculation.hourly]
+# Used only when [dvv_calculation.output].cadence = "hourly".
+
+source_folder = "CROSS_CORRELATIONS"
+# MSNoise keep_all output folder, relative to the MSNoise project directory.
+# The runner automatically writes keep_all=Y and this output_folder into
+# msnoise.sqlite when output.cadence is "hourly".
+
+keep_daily_cc = false
+# true keeps MSNoise daily CCF stacks in STACKS/001_DAYS in addition to the
+# hourly keep_all HDF5 files. Keep false for hourly-only large runs.
+
+output_dir = "HOURLY_DVV"
+# Hourly dv/v output folder, relative to the MSNoise project directory.
+
+stack_window_hours = 1
+# Number of hourly CCF windows in the MSNoise-style moving stack.
+
+reference_begin = "2021-05-01T00:00:00"
+reference_end = "2021-05-15T00:00:00"
+# Hourly reference stack interval. The interval is interpreted as
+# [reference_begin, reference_end), so the value above includes all hours from
+# 2021-05-01 through 2021-05-14.
+
+write_stack_files = false
+write_mwcs_files = false
+# Keep these false for large Alpine runs. Turning them on writes one stack/MWCS
+# file per hour, filter, component, and station pair, which can create a very
+# large number of small files.
+
+compute_all_pairs = false
+# true also computes an ALL pseudo-pair by aggregating MWCS values across pairs.
+# Keep false for large runs because it retains MWCS arrays across pairs.
+
+progress_interval_targets = 25
+# Print one progress line every N hourly targets.
+
+require_outputs = true
+
 [dvv_calculation.msnoise.extra_msnoise_config]
-# Optional raw MSNoise config overrides.
-# Add entries here only when a MSNoise key is not already exposed in this configure file.
+# CCF preprocessing parameters shared by MSNoise and native_scalar. Keeping one
+# source of truth prevents the two backends from silently using different
+# scientific processing.
+maxlag = 120.0
+overlap = 0.0
+windsorizing = 3.0
+whitening_type = "B"
+cc_type = "CC"
+cc_type_single_station_AC = "CC"
+cc_type_single_station_SC = "CC"
+resampling_method = "Lanczos"
+preprocess_lowpass = 8.0
+preprocess_highpass = 0.01
+preprocess_max_gap = 10.0
+preprocess_taper_length = 20.0
+remove_response = false
+archive_format = ""
+pws_timegate = 10.0
+pws_power = 2.0
