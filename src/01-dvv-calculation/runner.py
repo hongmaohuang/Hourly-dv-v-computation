@@ -542,7 +542,7 @@ def _write_msnoise_processing_config(cursor, msnoise_cfg: dict) -> None:
     _set_msnoise_config(
         cursor,
         "components_to_compute_single_station",
-        require_value(msnoise_cfg, "components_to_compute_single_station", "dvv_calculation.msnoise"),
+        str(msnoise_cfg.get("components_to_compute_single_station", "")),
     )
     _set_msnoise_config(cursor, "mov_stack", require_value(msnoise_cfg, "mov_stack", "dvv_calculation.msnoise"))
     _set_msnoise_config(cursor, "analysis_duration", require_value(msnoise_cfg, "analysis_duration", "dvv_calculation.msnoise"))
